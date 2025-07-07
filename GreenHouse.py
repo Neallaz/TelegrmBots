@@ -56,21 +56,22 @@ def save_expense(user_id, amount, main_category, sub_category, description="", d
             description,
             direction
         ])
-
 def load_expenses_filtered(period="all"):
     now = datetime.now(pytz.timezone("Asia/Amman"))
     today = now.date()
+
+    breakdown = defaultdict(lambda: defaultdict(float))  # {date/month: {category: total}}
     category_totals = defaultdict(float)
     income_total = 0.0
     outcome_total = 0.0
 
-    def date_in_period(date):
+    def date_in_period(dt):
         if period == "daily":
-            return date.date() == today
+            return dt.date() == today
         elif period == "monthly":
-            return date.year == today.year and date.month == today.month
+            return dt.year == today.year and dt.month == today.month
         elif period == "yearly":
-            return date.year == today.year
+            return dt.year == today.year
         return True  # all
 
     try:
@@ -87,6 +88,15 @@ def load_expenses_filtered(period="all"):
                         continue
                     amount = float(amount)
                     key = f"{main_cat} > {sub_cat}"
+
+                    # Summary breakdowns
+                    if period == "monthly":
+                        day_key = dt.strftime("%Y-%m-%d")
+                        breakdown[day_key][key] += amount
+                    elif period == "yearly":
+                        month_key = dt.strftime("%Y-%m")
+                        breakdown[month_key][key] += amount
+
                     category_totals[key] += amount
                     if direction == "income":
                         income_total += amount
@@ -95,7 +105,7 @@ def load_expenses_filtered(period="all"):
     except FileNotFoundError:
         pass
 
-    return category_totals, income_total, outcome_total, now
+    return category_totals, income_total, outcome_total, now, breakdown
 
 # === PARSER ===
 def parse_message_for_amount(text):
@@ -149,7 +159,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     period = query.data.replace("report_", "")
-    category_totals, income_total, outcome_total, now = load_expenses_filtered(period)
+    category_totals, income_total, outcome_total, now, breakdown = load_expenses_filtered(period)
 
     if not category_totals:
         await query.edit_message_text("📭 هیچ تراکنشی در این بازه یافت نشد.")
@@ -160,8 +170,20 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = f"📊 *گزارش {get_period_label(period)}:*\n\n"
     message += date_display + "\n"
+
+    # Summary by category
     for cat, total in category_totals.items():
         message += f"• {cat}: *{total:,.0f}* ریال\n"
+
+    # Breakdown by day or month (only for monthly or yearly)
+    if period in ["monthly", "yearly"] and breakdown:
+        message += "\n📆 جزئیات:\n"
+        for sub_period in sorted(breakdown.keys()):
+            message += f"\n🗓️ {sub_period}:\n"
+            for cat, amt in breakdown[sub_period].items():
+                message += f"  • {cat}: {amt:,.0f} ریال\n"
+
+    # Totals
     message += "\n"
     message += f"🟢 درآمد کل: *{income_total:,.0f}* ریال\n"
     message += f"🔴 هزینه کل: *{outcome_total:,.0f}* ریال\n"
@@ -176,7 +198,6 @@ def get_period_label(period):
         "yearly": "سالانه",
         "all": "کامل"
     }.get(period, "کامل")
-
 # === MAIN MESSAGE HANDLER ===
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
