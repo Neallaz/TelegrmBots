@@ -1,16 +1,20 @@
 import csv
 import re
-from datetime import datetime
-from collections import defaultdict
+import os
 import pytz
+import jdatetime
+from datetime import datetime, timedelta
+from collections import defaultdict
+
 import asyncio
 import nest_asyncio
-import os
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -21,7 +25,7 @@ TOKEN = "7505911361:AAHwFC8EaU4feKZnYAVH_JCurArYSaXvsiM"
 CSV_FILE = os.path.join(".", "expenses.csv")
 INCOME_CATEGORIES = {
     "فروش": ["خیار", "گوجه", "هندوانه"],
-    "واریزی": ["سهم", "کمک", "بانک"]
+    "واریزی": ["سهم", "تسهیلات", "بانک"]
 }
 OUTCOME_CATEGORIES = {
     "شارژ": ["برق", "گاز", "تلفن"],
@@ -35,6 +39,7 @@ main_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
 
 # === CSV HELPERS ===
 def save_expense(user_id, amount, main_category, sub_category, description="", dt=None, direction="other"):
@@ -52,16 +57,34 @@ def save_expense(user_id, amount, main_category, sub_category, description="", d
             direction
         ])
 
-def load_expenses():
+def load_expenses_filtered(period="all"):
+    now = datetime.now(pytz.timezone("Asia/Amman"))
+    today = now.date()
     category_totals = defaultdict(float)
     income_total = 0.0
     outcome_total = 0.0
+
+    def date_in_period(date):
+        if period == "daily":
+            return date.date() == today
+        elif period == "monthly":
+            return date.year == today.year and date.month == today.month
+        elif period == "yearly":
+            return date.year == today.year
+        return True  # all
+
     try:
         with open(CSV_FILE, mode='r', encoding='utf-8') as file:
             reader = csv.reader(file)
             for row in reader:
                 if len(row) == 7:
-                    _, _, amount, main_cat, sub_cat, description, direction = row
+                    date_str, _, amount, main_cat, sub_cat, _, direction = row
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        continue
+                    if not date_in_period(dt):
+                        continue
                     amount = float(amount)
                     key = f"{main_cat} > {sub_cat}"
                     category_totals[key] += amount
@@ -71,7 +94,8 @@ def load_expenses():
                         outcome_total += amount
     except FileNotFoundError:
         pass
-    return category_totals, income_total, outcome_total
+
+    return category_totals, income_total, outcome_total, now
 
 # === PARSER ===
 def parse_message_for_amount(text):
@@ -110,20 +134,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 سلام! خوش آمدید.\nلطفاً یکی از گزینه‌ها را انتخاب کنید:",
         reply_markup=main_keyboard
     )
-
+# === REPORTS ===
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    category_totals, income_total, outcome_total = load_expenses()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 گزارش روزانه", callback_data="report_daily")],
+        [InlineKeyboardButton("🗓️ گزارش ماهانه", callback_data="report_monthly")],
+        [InlineKeyboardButton("📆 گزارش سالانه", callback_data="report_yearly")],
+        [InlineKeyboardButton("📂 همه موارد", callback_data="report_all")],
+    ])
+    await update.message.reply_text("📊 لطفاً نوع گزارش را انتخاب کنید:", reply_markup=keyboard)
+
+async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    period = query.data.replace("report_", "")
+    category_totals, income_total, outcome_total, now = load_expenses_filtered(period)
+
     if not category_totals:
-        await update.message.reply_text("📭 هنوز داده‌ای ثبت نشده است.")
+        await query.edit_message_text("📭 هیچ تراکنشی در این بازه یافت نشد.")
         return
-    message = "📊 *گزارش مالی شما:*\n\n"
+
+    jalali_now = jdatetime.datetime.fromgregorian(datetime=now)
+    date_display = f"📅 تاریخ: {now.strftime('%Y/%m/%d')} | {jalali_now.strftime('%Y/%m/%d')} (جلالی)\n"
+
+    message = f"📊 *گزارش {get_period_label(period)}:*\n\n"
+    message += date_display + "\n"
     for cat, total in category_totals.items():
         message += f"• {cat}: *{total:,.0f}* ریال\n"
     message += "\n"
     message += f"🟢 درآمد کل: *{income_total:,.0f}* ریال\n"
     message += f"🔴 هزینه کل: *{outcome_total:,.0f}* ریال\n"
     message += f"⚖️ مانده حساب: *{income_total - outcome_total:,.0f}* ریال"
-    await update.message.reply_text(message, parse_mode='Markdown')
+
+    await query.edit_message_text(message, parse_mode="Markdown")
+
+def get_period_label(period):
+    return {
+        "daily": "روزانه",
+        "monthly": "ماهانه",
+        "yearly": "سالانه",
+        "all": "کامل"
+    }.get(period, "کامل")
 
 # === MAIN MESSAGE HANDLER ===
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,6 +419,7 @@ async def main():
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("report", report))
+    application.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     print("🤖 Bot is running...")
     await application.run_polling()
